@@ -16,9 +16,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 class WattpadScraperV3:
     """
     Improved Wattpad scraper based on actual HTML structure inspection.
-    v4.1 Improvements:
-    - FIXED: extract_chapter_text now runs BEFORE any decompose() calls
-    - FIXED: Trailing Wattpad comment counts stripped from paragraph text
+    v4.2 Improvements:
+    - FIXED: Replaced rel=next URL pagination with scroll-to-load
+      (URL pagination caused duplicate text since /page/2 DOM includes page 1 content)
+    - FIXED: extract_chapter_text runs BEFORE any decompose() calls
     - FIXED: Uses copy.copy(p) to avoid mutating shared soup object
     - Uses sr-only spans for accurate stat extraction
     - Updated tag selector to use pill__pziVI class
@@ -87,7 +88,7 @@ class WattpadScraperV3:
             return 0.0
 
     def _load_page_content(self):
-        """Scrolls and interacts with the page to ensure elements are loaded."""
+        """Scrolls and interacts with the story overview page to ensure all chapters load."""
         print("    ...Loading full page content...")
 
         total_height = self.driver.execute_script("return document.body.scrollHeight")
@@ -112,6 +113,37 @@ class WattpadScraperV3:
                     time.sleep(1)
         except:
             pass
+
+    def _scroll_to_load_full_chapter(self):
+        """
+        Scrolls the chapter page slowly until no new paragraphs appear.
+        Wattpad lazy-loads paginated content via scroll — this replaces
+        the rel=next URL navigation which caused duplicate extraction
+        because /page/2 DOM already includes page 1 paragraphs.
+        """
+        print(f"      → Scrolling to load full chapter...")
+        last_count = 0
+        stall_attempts = 0
+        max_stalls = 3  # Stop after 3 scrolls with no new paragraphs
+
+        while stall_attempts < max_stalls:
+            # Scroll to bottom
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2.5)
+
+            # Count current paragraphs in DOM
+            current_count = self.driver.execute_script(
+                "return document.querySelectorAll('p[data-p-id]').length;"
+            )
+
+            if current_count > last_count:
+                print(f"      → {current_count} paragraphs loaded so far...")
+                last_count = current_count
+                stall_attempts = 0  # Reset on progress
+            else:
+                stall_attempts += 1
+
+        print(f"      → Full chapter loaded: {last_count} paragraphs total.")
 
     def parse_metadata_bs4(self, html_content, url):
         """Parses story metadata using BeautifulSoup with improved selectors."""
@@ -291,14 +323,12 @@ class WattpadScraperV3:
 
     def extract_chapter_text(self, soup):
         """
-        Extracts the actual story text from a chapter page.
-        IMPORTANT: Must be called BEFORE any decompose() operations on the soup object.
-        Uses copy.copy() to avoid mutating the shared soup.
-        Strips trailing Wattpad comment counts (e.g. '+', '2', '25') from each paragraph.
+        Extracts story text from a chapter page soup object.
+        MUST be called BEFORE any decompose() operations on the soup.
+        Uses copy.copy(p) to avoid mutating the shared soup object.
         """
         text_content = []
 
-        # Collect ALL p[data-p-id] — do this before any noise removal
         paragraphs = soup.find_all('p', attrs={'data-p-id': True})
 
         if paragraphs:
@@ -306,7 +336,7 @@ class WattpadScraperV3:
                 # Clone to avoid mutating the shared soup object
                 p_copy = copy.copy(p)
 
-                # Remove inline UI elements (comment markers, buttons) from the clone
+                # Remove inline UI elements from the clone only
                 for ui_element in p_copy.find_all(
                     ['div', 'button'],
                     class_=re.compile(r'component-wrapper|comment-marker')
@@ -336,22 +366,32 @@ class WattpadScraperV3:
         return '\n\n'.join(text_content) if text_content else ""
 
     def scrape_chapter_stats(self, chapter_url, extract_text=False):
-        """Visits a chapter page to get specific stats from story-stats div."""
+        """
+        Visits a chapter page to get stats and optionally extract full text.
+        Uses scroll-to-load instead of URL pagination to avoid duplicate text.
+        Wattpad appends paginated content to the existing DOM on scroll,
+        so navigating to /page/2 would include page 1 paragraphs again.
+        """
         try:
             print(f"    Scanning: {chapter_url[:60]}...")
             self.driver.get(chapter_url)
             time.sleep(3)
 
+            # ✅ STEP 1: Scroll to load ALL paginated content into the DOM
+            if extract_text:
+                self._scroll_to_load_full_chapter()
+                # Scroll back to top so stats header elements are in view
+                self.driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
+
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             stats = {"Reads": "N/A", "Votes": "N/A", "Comments": "N/A"}
 
-            # ✅ STEP 1: Extract text FIRST, before any decompose() calls
-            # This ensures the "YOU'LL ALSO LIKE" injection between paragraphs
-            # cannot swallow story content during noise removal
+            # ✅ STEP 2: Extract text ONCE from fully-loaded soup, before any decompose()
             if extract_text:
                 stats['Chapter_Text'] = self.extract_chapter_text(soup)
 
-            # ✅ STEP 2: NOW do noise removal (safe — text already extracted)
+            # ✅ STEP 3: Noise removal for stats only (text already safely extracted)
             for noise in soup.find_all(
                 ['div', 'section', 'aside'],
                 class_=re.compile(r'recommend|sidebar|next-up|story-list|similar|related|footer|you-may-also')
@@ -426,13 +466,13 @@ class WattpadScraperV3:
                     val_match = re.search(num_regex, label, re.IGNORECASE)
                     if val_match:
                         num = val_match.group(1).replace(' ', '').replace(',', '')
-                        if 'read'    in label and stats['Reads']    == "N/A": stats['Reads']    = num
-                        elif 'vote'  in label and stats['Votes']    == "N/A": stats['Votes']    = num
+                        if 'read'      in label and stats['Reads']    == "N/A": stats['Reads']    = num
+                        elif 'vote'    in label and stats['Votes']    == "N/A": stats['Votes']    = num
                         elif 'comment' in label and stats['Comments'] == "N/A": stats['Comments'] = num
                     if all(v != "N/A" for v in [stats['Reads'], stats['Votes'], stats['Comments']]):
                         break
 
-            # --- METHOD 5: Visible text in chapter area only ---
+            # --- METHOD 5: Visible text last resort ---
             if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
                 main_content = soup.find('div', id='story-reading') or soup.find('article')
                 if main_content:
@@ -485,6 +525,7 @@ class WattpadScraperV3:
             print(f"{'='*70}")
             print(stats['Chapter_Text'][:500] + "...")
             print(f"\nTotal characters: {len(stats['Chapter_Text'])}")
+            print(f"Total paragraphs: {stats['Chapter_Text'].count(chr(10)+chr(10)) + 1}")
 
         print(f"{'='*70}")
 
@@ -536,7 +577,7 @@ class WattpadScraperV3:
                 print(f"\n{'='*70}")
                 print(f"SCRAPING STATS FOR EACH CHAPTER")
                 if self.should_extract_text:
-                    print("(Also extracting chapter text)")
+                    print("(Also extracting full chapter text via scroll-to-load)")
                 print(f"{'='*70}")
 
                 for i, chapter in enumerate(chapters, 1):
@@ -564,7 +605,7 @@ class WattpadScraperV3:
             df_chapters = pd.DataFrame(chapters)
 
             suffix = "_local" if local_file_path else "_complete"
-            df_story.to_csv(f"story_metadata{suffix}.csv",    index=False, encoding='utf-8-sig')
+            df_story.to_csv(f"story_metadata{suffix}.csv",       index=False, encoding='utf-8-sig')
             df_chapters.to_csv(f"chapters_metadata{suffix}.csv", index=False, encoding='utf-8-sig')
 
             print(f"✓ Saved: story_metadata{suffix}.csv")
@@ -605,7 +646,7 @@ class WattpadScraperV3:
 
 if __name__ == "__main__":
     print("="*70)
-    print("WATTPAD SCRAPER V4.1 (Fixed Text Extraction)")
+    print("WATTPAD SCRAPER V4.2 (Scroll-to-Load, No Duplicate Text)")
     print("="*70)
     print("1. Scrape Live URL (Metadata + Chapters)")
     print("2. Scrape Live URL (Metadata + Chapters + Detailed Stats)")
