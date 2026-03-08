@@ -315,11 +315,6 @@ class WattpadScraperV3:
 
                 para_text = p_copy.get_text(strip=True)
 
-                # Strip trailing Wattpad comment counts:
-                # Wattpad appends '+' (zero comments) or a digit count like '2', '25'
-                # at the very end of the paragraph text — remove them
-                para_text = re.sub(r'[\+\d]+$', '', para_text).strip()
-
                 if para_text:
                     text_content.append(para_text)
 
@@ -334,7 +329,7 @@ class WattpadScraperV3:
                 ):
                     ui_element.decompose()
                 for p in pre_copy.find_all('p'):
-                    para_text = re.sub(r'[\+\d]+$', '', p.get_text(strip=True)).strip()
+                    para_text = p.get_text(strip=True)
                     if para_text:
                         text_content.append(para_text)
 
