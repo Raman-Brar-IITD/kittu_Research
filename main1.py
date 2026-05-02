@@ -2,7 +2,9 @@ import pandas as pd
 import time
 import re
 import os
+import copy
 import unicodedata
+import multiprocessing
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -10,54 +12,327 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 
-class WattpadScraperV5:
+# ─────────────────────────────────────────────────────────────────────────────
+# MODULE-LEVEL WORKER STATE
+# Each worker process gets its own Chrome driver via the initializer.
+# Globals are safe here because multiprocessing gives each worker its own
+# memory space — there is no shared state between workers.
+# ─────────────────────────────────────────────────────────────────────────────
+_worker_driver = None
+
+
+def _worker_init(headless: bool):
+    """Called once per worker process at pool startup."""
+    global _worker_driver
+    options = Options()
+    if headless:
+        options.add_argument('--headless=new')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument("window-size=1920,1080")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    service = Service(ChromeDriverManager().install())
+    _worker_driver = webdriver.Chrome(service=service, options=options)
+    _worker_driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+        "userAgent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+    })
+    _worker_driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATELESS HELPER FUNCTIONS  (picklable — safe to use in worker processes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_safe_folder_name(name: str) -> str:
     """
-    Wattpad scraper v5.0
-    KEY FIX: Wattpad splits chapters into multiple pages (/page/1, /page/2, ...).
-             The scraper now visits ALL pages of a chapter and combines the text.
+    Converts a story title into a safe folder name.
+    - Strips characters invalid on Windows/macOS/Linux
+    - Collapses whitespace
+    - Limits to 80 chars to avoid path-length issues
+    """
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
+    safe = re.sub(r'\s+', ' ', safe).strip()
+    safe = safe.strip('. ')          # Windows dislikes leading/trailing dots
+    return safe[:80] if safe else "Unknown_Story"
+
+
+def _scroll_to_load_full_chapter(driver):
+    """Scrolls until no new paragraphs appear."""
+    print(f"      → Scrolling to load full chapter...")
+    last_count = 0
+    stall_attempts = 0
+    max_stalls = 3
+
+    while stall_attempts < max_stalls:
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2.5)
+        current_count = driver.execute_script(
+            "return document.querySelectorAll('p[data-p-id]').length;"
+        )
+        if current_count > last_count:
+            print(f"      → {current_count} paragraphs loaded so far...")
+            last_count = current_count
+            stall_attempts = 0
+        else:
+            stall_attempts += 1
+
+    print(f"      → Full chapter loaded: {last_count} paragraphs total.")
+
+
+def _extract_chapter_text(soup):
+    """Extracts story text. Must be called BEFORE any decompose() operations."""
+    text_content = []
+    paragraphs = soup.find_all('p', attrs={'data-p-id': True})
+
+    if paragraphs:
+        for p in paragraphs:
+            p_copy = copy.copy(p)
+            for ui in p_copy.find_all(
+                ['div', 'button'],
+                class_=re.compile(r'component-wrapper|comment-marker')
+            ):
+                ui.decompose()
+            para_text = p_copy.get_text(strip=True)
+            if para_text:
+                text_content.append(para_text)
+
+    if not text_content:
+        pre_tag = soup.find('pre', class_=re.compile(r'chapter-text|story-text'))
+        if pre_tag:
+            pre_copy = copy.copy(pre_tag)
+            for ui in pre_copy.find_all(
+                ['div', 'button'],
+                class_=re.compile(r'component-wrapper|comment-marker')
+            ):
+                ui.decompose()
+            for p in pre_copy.find_all('p'):
+                para_text = p.get_text(strip=True)
+                if para_text:
+                    text_content.append(para_text)
+
+    return '\n\n'.join(text_content) if text_content else ""
+
+
+def _scrape_stats_from_soup(soup):
+    """Extracts Reads/Votes/Comments from a chapter page soup."""
+    stats = {"Reads": "N/A", "Votes": "N/A", "Comments": "N/A"}
+
+    # Noise removal
+    for noise in soup.find_all(
+        ['div', 'section', 'aside'],
+        class_=re.compile(r'recommend|sidebar|next-up|story-list|similar|related|footer|you-may-also')
+    ):
+        noise.decompose()
+    for div in soup.find_all('div'):
+        text = div.get_text(strip=True)
+        if any(p in text.lower() for p in ['you may also like', 'recommended', 'similar stories', 'more stories']):
+            if len(text) < 500:
+                div.decompose()
+
+    # Method 1: story-stats div
+    stats_div = soup.find('div', class_='story-stats')
+    if stats_div:
+        reads_span = stats_div.find('span', class_='reads')
+        if reads_span:
+            title_attr = (reads_span.get('title') or
+                          reads_span.get('data-original-title') or
+                          reads_span.get('data-toggle'))
+            if title_attr:
+                m = re.search(r'([\d,]+)\s+Read', title_attr, re.IGNORECASE)
+                if m:
+                    stats['Reads'] = m.group(1).replace(',', '')
+        votes_span = stats_div.find('span', class_='votes')
+        if votes_span:
+            m = re.search(r'([\d,]+)', votes_span.get_text(strip=True))
+            if m:
+                stats['Votes'] = m.group(1).replace(',', '')
+        comments_span = stats_div.find('span', class_='comments')
+        if comments_span:
+            m = re.search(r'([\d,]+)', comments_span.get_text(strip=True))
+            if m:
+                stats['Comments'] = m.group(1).replace(',', '')
+
+    # Method 2: sr-only spans
+    if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
+        main_area = soup.find('div', id='story-reading') or soup.find('article') or soup
+        for span in main_area.find_all('span', class_='sr-only'):
+            text = span.get_text(strip=True)
+            rm = re.search(r'Reads?\s+([\d,]+)',    text, re.IGNORECASE)
+            vm = re.search(r'Votes?\s+([\d,]+)',    text, re.IGNORECASE)
+            cm = re.search(r'Comments?\s+([\d,]+)', text, re.IGNORECASE)
+            if rm and stats['Reads']    == "N/A": stats['Reads']    = rm.group(1).replace(',', '')
+            if vm and stats['Votes']    == "N/A": stats['Votes']    = vm.group(1).replace(',', '')
+            if cm and stats['Comments'] == "N/A": stats['Comments'] = cm.group(1).replace(',', '')
+            if all(v != "N/A" for v in stats.values()):
+                break
+
+    # Method 3: data-toggle tooltip
+    if stats['Reads'] == "N/A":
+        header = soup.find('header') or soup.find('div', class_=re.compile(r'story-info|chapter-info'))
+        area = header if header else soup
+        for el in area.find_all(attrs={"data-toggle": "tooltip"}):
+            title = el.get('title', '') or el.get('data-original-title', '')
+            if 'read' in title.lower():
+                m = re.search(r'([\d,]+)\s+Read', title, re.IGNORECASE)
+                if m:
+                    stats['Reads'] = m.group(1).replace(',', '')
+                    break
+
+    # Method 4: aria-label
+    if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
+        num_regex = r'([\d,]+(?:\.\d+)?\s*[KMB]?)'
+        main_content = soup.find('div', id='story-reading') or soup.find('article') or soup
+        for el in main_content.find_all(attrs={"aria-label": True}):
+            label = el['aria-label'].lower()
+            val_match = re.search(num_regex, label, re.IGNORECASE)
+            if val_match:
+                num = val_match.group(1).replace(' ', '').replace(',', '')
+                if 'read'      in label and stats['Reads']    == "N/A": stats['Reads']    = num
+                elif 'vote'    in label and stats['Votes']    == "N/A": stats['Votes']    = num
+                elif 'comment' in label and stats['Comments'] == "N/A": stats['Comments'] = num
+            if all(v != "N/A" for v in stats.values()):
+                break
+
+    # Method 5: visible meta text
+    if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
+        main_content = soup.find('div', id='story-reading') or soup.find('article')
+        if main_content:
+            meta_parts = (
+                main_content.select('[class*="meta"] span') +
+                main_content.select('[class*="stats"] span')
+            )
+            nums = []
+            for m in meta_parts:
+                txt = m.get_text(separator=" ", strip=True)
+                for f in re.findall(r'[\d,]+(?:\.\d+)?\s*[KMB]?', txt, re.IGNORECASE):
+                    if re.search(r'\d', f):
+                        clean = f.replace(' ', '').replace(',', '')
+                        if clean not in nums:
+                            nums.append(clean)
+            if stats['Reads']    == "N/A" and len(nums) >= 1: stats['Reads']    = nums[0]
+            if stats['Votes']    == "N/A" and len(nums) >= 2: stats['Votes']    = nums[1]
+            if stats['Comments'] == "N/A" and len(nums) >= 3: stats['Comments'] = nums[2]
+
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WORKER TASK  (top-level — required for multiprocessing pickling)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scrape_chapter_task(args):
+    """
+    Executed in a worker process for a single chapter.
+
+    Args:
+        args: tuple of (chapter_dict, extract_text: bool)
+
+    Returns:
+        chapter_dict updated with stats and optionally Chapter_Text.
+    """
+    global _worker_driver
+    chapter, extract_text = args
+    url = chapter['URL']
+
+    try:
+        pid = os.getpid()
+        print(f"    [PID {pid}] Scanning: {url[:55]}...")
+        _worker_driver.get(url)
+        time.sleep(3)
+
+        if extract_text:
+            _scroll_to_load_full_chapter(_worker_driver)
+            _worker_driver.execute_script("window.scrollTo(0, 0);")
+            time.sleep(1)
+
+        soup = BeautifulSoup(_worker_driver.page_source, 'html.parser')
+
+        if extract_text:
+            chapter['Chapter_Text'] = _extract_chapter_text(soup)
+
+        stats = _scrape_stats_from_soup(soup)
+        chapter.update(stats)
+
+        print(f"    [PID {pid}] ✓ {chapter['Title'][:30]:30} "
+              f"R:{stats['Reads']:>6} V:{stats['Votes']:>4} C:{stats['Comments']:>4}")
+
+    except Exception as e:
+        print(f"    [ERROR] {url[:55]} → {e}")
+        chapter.update({"Reads": "Error", "Votes": "Error", "Comments": "Error"})
+        if extract_text:
+            chapter['Chapter_Text'] = ""
+
+    return chapter
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN SCRAPER CLASS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WattpadScraperV5Parallel:
+    """
+    Multi-URL Parallel Wattpad scraper — v5.1
+
+    For each story URL:
+      outputs/<Story Title>/
+      ├── story_metadata.csv
+      ├── chapters_metadata.csv
+      ├── FULL_STORY.txt               ← all chapters combined in order
+      └── chapters/
+          ├── 01 - Chapter Title.txt
+          ├── 02 - Chapter Title.txt
+          └── ...
     """
 
-    def __init__(self, headless=False, scrape_chapter_stats=True, extract_chapter_text=False):
-        self.headless = headless
-        self.should_scrape_stats = scrape_chapter_stats
-        self.should_extract_text = extract_chapter_text
-        self.driver = None
-        self._init_driver()
+    def __init__(self, headless=True, scrape_chapter_stats=True,
+                 extract_chapter_text=False, num_workers=3):
+        self.headless             = headless
+        self.should_scrape_stats  = scrape_chapter_stats
+        self.should_extract_text  = extract_chapter_text
+        self.num_workers          = num_workers
+        self._main_driver         = self._make_driver(headless=False)
 
-    def _init_driver(self):
-        if self.driver:
-            try:
-                self.driver.quit()
-            except:
-                pass
+    # ── driver factory ───────────────────────────────────────────────────────
 
+    def _make_driver(self, headless=False):
         options = Options()
-        if self.headless:
+        if headless:
             options.add_argument('--headless=new')
-
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
         options.add_argument("window-size=1920,1080")
-        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
+        options.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=options)
-
-        self.driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+            "userAgent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
         })
-        self.driver.execute_script(
+        driver.execute_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
+        return driver
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+    # ── text helpers ─────────────────────────────────────────────────────────
 
     def normalize_text(self, text):
         if not text:
@@ -66,385 +341,117 @@ class WattpadScraperV5:
         ascii_text = normalized.encode('ascii', 'ignore').decode('ascii').strip()
         return re.sub(r'\s+', ' ', ascii_text)
 
-    def safe_filename(self, text, max_length=60):
-        """Converts a story title into a safe filename/folder string."""
-        safe = re.sub(r'[<>:"/\\|?*]', '', text)
-        safe = safe.strip().replace(' ', '_')
-        safe = re.sub(r'_+', '_', safe)
-        return safe[:max_length]
-
-    def _parse_volume_string(self, text):
-        try:
-            text = text.upper().replace(',', '').replace(' ', '')
-            multiplier = 1
-            if 'K' in text:
-                multiplier = 1_000;    text = text.replace('K', '')
-            elif 'M' in text:
-                multiplier = 1_000_000; text = text.replace('M', '')
-            elif 'B' in text:
-                multiplier = 1_000_000_000; text = text.replace('B', '')
-            return float(text) * multiplier
-        except:
-            return 0.0
-
-    # ------------------------------------------------------------------
-    # Page loading helpers
-    # ------------------------------------------------------------------
+    # ── page loading ─────────────────────────────────────────────────────────
 
     def _load_page_content(self):
-        """Scrolls the page to trigger lazy-loaded elements."""
         print("    ...Loading full page content...")
-        total_height = self.driver.execute_script("return document.body.scrollHeight")
+        total_height = self._main_driver.execute_script("return document.body.scrollHeight")
         for i in range(1, 6):
-            self.driver.execute_script(f"window.scrollTo(0, {total_height * (i/5)});")
+            self._main_driver.execute_script(f"window.scrollTo(0, {total_height * (i/5)});")
             time.sleep(0.8)
-
         try:
-            toc = self.driver.find_element(By.CLASS_NAME, "story-parts")
-            self.driver.execute_script(
-                "arguments[0].scrollIntoView({behavior:'smooth',block:'center'});", toc
+            toc = self._main_driver.find_element(By.CLASS_NAME, "story-parts")
+            self._main_driver.execute_script(
+                "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", toc
             )
             time.sleep(2)
-        except:
-            self.driver.execute_script(f"window.scrollTo(0, {total_height * 0.4});")
+        except Exception:
+            self._main_driver.execute_script(f"window.scrollTo(0, {total_height * 0.4});")
             time.sleep(2)
-
         try:
-            buttons = self.driver.find_elements(
-                By.XPATH, "//button[contains(text(),'Show more') or contains(@class,'more')]"
+            buttons = self._main_driver.find_elements(
+                By.XPATH, "//button[contains(text(), 'Show more') or contains(@class, 'more')]"
             )
             for btn in buttons:
                 if btn.is_displayed():
-                    self.driver.execute_script("arguments[0].click();", btn)
+                    self._main_driver.execute_script("arguments[0].click();", btn)
                     time.sleep(1)
-        except:
+        except Exception:
             pass
 
-    def _get_total_pages(self, soup, base_chapter_url):
-        """
-        Detects how many pages a chapter has.
-        Looks for page-navigation links like /page/3 in the HTML.
-        """
-        # Strip any existing /page/N suffix from the base URL
-        base_url = re.sub(r'/page/\d+$', '', base_chapter_url.rstrip('/'))
-
-        page_nums = set()
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            m = re.search(r'/page/(\d+)', href)
-            if m:
-                page_nums.add(int(m.group(1)))
-
-        # Also check <link rel="next"> tags
-        for link in soup.find_all('link', rel=True):
-            if 'next' in link.get('rel', []):
-                m = re.search(r'/page/(\d+)', link.get('href', ''))
-                if m:
-                    page_nums.add(int(m.group(1)))
-
-        return max(page_nums) if page_nums else 1
-
-    # ------------------------------------------------------------------
-    # Text extraction (single page)
-    # ------------------------------------------------------------------
-
-    def _extract_text_from_soup(self, soup):
-        """Extract story paragraphs from a single page's soup."""
-        text_content = []
-
-        paragraphs = soup.find_all('p', attrs={'data-p-id': True})
-        if paragraphs:
-            for p in paragraphs:
-                # Remove inline comment/UI widgets
-                for ui in p.find_all(
-                    ['div', 'button'],
-                    class_=re.compile(r'component-wrapper|comment-marker')
-                ):
-                    ui.decompose()
-                para_text = p.get_text(strip=True)
-                if para_text and para_text != '<br>':
-                    text_content.append(para_text)
-
-        # Fallback: pre > p
-        if not text_content:
-            pre_tag = soup.find('pre', class_=re.compile(r'chapter-text|story-text'))
-            if pre_tag:
-                for ui in pre_tag.find_all(
-                    ['div', 'button'],
-                    class_=re.compile(r'component-wrapper|comment-marker')
-                ):
-                    ui.decompose()
-                for p in pre_tag.find_all('p'):
-                    t = p.get_text(strip=True)
-                    if t:
-                        text_content.append(t)
-
-        return text_content
-
-    # ------------------------------------------------------------------
-    # *** CORE FIX: Multi-page chapter text extraction ***
-    # ------------------------------------------------------------------
-
-    def extract_full_chapter_text(self, chapter_base_url):
-        """
-        Visits every page of a chapter (/page/1, /page/2, ...) and returns
-        the combined text as a single string.
-
-        WHY THIS IS NEEDED:
-        Wattpad splits long chapters into multiple pages. The base chapter URL
-        only shows page 1. Pages 2, 3, 4 ... must be fetched separately.
-        """
-        all_paragraphs = []
-
-        # ---- Page 1 (already loaded by caller, but we load it fresh here) ----
-        base_url = re.sub(r'/page/\d+$', '', chapter_base_url.rstrip('/'))
-        page1_url = f"{base_url}/page/1"
-
-        print(f"      → Fetching page 1 ...")
-        self.driver.get(page1_url)
-        time.sleep(3)
-
-        soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-        all_paragraphs.extend(self._extract_text_from_soup(soup))
-
-        # ---- Detect total pages ----
-        total_pages = self._get_total_pages(soup, base_url)
-        print(f"      → Chapter has {total_pages} page(s).")
-
-        # ---- Fetch remaining pages ----
-        for page_num in range(2, total_pages + 1):
-            page_url = f"{base_url}/page/{page_num}"
-            print(f"      → Fetching page {page_num} ...")
-            self.driver.get(page_url)
-            time.sleep(3)
-
-            page_soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            page_paragraphs = self._extract_text_from_soup(page_soup)
-            all_paragraphs.extend(page_paragraphs)
-            print(f"         ({len(page_paragraphs)} paragraphs found on page {page_num})")
-
-        return '\n\n'.join(all_paragraphs)
-
-    # ------------------------------------------------------------------
-    # Stats scraping (with optional full-chapter text)
-    # ------------------------------------------------------------------
-
-    def scrape_chapter_stats(self, chapter_url, extract_text=False):
-        """
-        Visits a chapter page, extracts stats, and optionally the FULL text
-        across ALL pages of that chapter.
-        """
-        try:
-            print(f"    Scanning: {chapter_url[:60]}...")
-            self.driver.get(chapter_url)
-            time.sleep(3)
-
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            stats = {"Reads": "N/A", "Votes": "N/A", "Comments": "N/A"}
-
-            # Remove sidebar/recommendation noise
-            for noise in soup.find_all(
-                ['div', 'section', 'aside'],
-                class_=re.compile(r'recommend|sidebar|next-up|story-list|similar|related|footer|you-may-also')
-            ):
-                noise.decompose()
-            for div in soup.find_all('div'):
-                text = div.get_text(strip=True)
-                if any(p in text.lower() for p in ['you may also like', 'recommended', 'similar stories', 'more stories']):
-                    if len(text) < 500:
-                        div.decompose()
-
-            # ---- Extract FULL text (all pages) ----
-            if extract_text:
-                print(f"      Extracting full chapter text (all pages)...")
-                stats['Chapter_Text'] = self.extract_full_chapter_text(chapter_url)
-                print(f"      Total paragraphs: {stats['Chapter_Text'].count(chr(10)*2) + 1}")
-
-            # ---- Stats: Method 1 — story-stats div ----
-            stats_div = soup.find('div', class_='story-stats')
-            if stats_div:
-                reads_span = stats_div.find('span', class_='reads')
-                if reads_span:
-                    title_attr = (reads_span.get('title') or
-                                  reads_span.get('data-original-title') or
-                                  reads_span.get('data-toggle'))
-                    if title_attr:
-                        m = re.search(r'([\d,]+)\s+Read', title_attr, re.IGNORECASE)
-                        if m:
-                            stats['Reads'] = m.group(1).replace(',', '')
-
-                votes_span = stats_div.find('span', class_='votes')
-                if votes_span:
-                    m = re.search(r'([\d,]+)', votes_span.get_text(strip=True))
-                    if m:
-                        stats['Votes'] = m.group(1).replace(',', '')
-
-                comments_span = stats_div.find('span', class_='comments')
-                if comments_span:
-                    m = re.search(r'([\d,]+)', comments_span.get_text(strip=True))
-                    if m:
-                        stats['Comments'] = m.group(1).replace(',', '')
-
-            # ---- Stats: Method 2 — sr-only spans ----
-            if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
-                main_area = soup.find('div', id='story-reading') or soup.find('article') or soup
-                for span in main_area.find_all('span', class_='sr-only'):
-                    text = span.get_text(strip=True)
-                    rm = re.search(r'Reads?\s+([\d,]+)', text, re.IGNORECASE)
-                    vm = re.search(r'Votes?\s+([\d,]+)', text, re.IGNORECASE)
-                    cm = re.search(r'Comments?\s+([\d,]+)', text, re.IGNORECASE)
-                    if rm and stats['Reads'] == "N/A":
-                        stats['Reads'] = rm.group(1).replace(',', '')
-                    if vm and stats['Votes'] == "N/A":
-                        stats['Votes'] = vm.group(1).replace(',', '')
-                    if cm and stats['Comments'] == "N/A":
-                        stats['Comments'] = cm.group(1).replace(',', '')
-                    if all(v != "N/A" for v in stats.values()):
-                        break
-
-            # ---- Stats: Method 3 — aria-label ----
-            if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
-                num_re = r'([\d,]+(?:\.\d+)?\s*[KMB]?)'
-                main_content = soup.find('div', id='story-reading') or soup.find('article') or soup
-                for el in main_content.find_all(attrs={"aria-label": True}):
-                    label = el['aria-label'].lower()
-                    vm = re.search(num_re, label, re.IGNORECASE)
-                    if vm:
-                        num = vm.group(1).replace(' ', '').replace(',', '')
-                        if 'read' in label and stats['Reads'] == "N/A":
-                            stats['Reads'] = num
-                        elif 'vote' in label and stats['Votes'] == "N/A":
-                            stats['Votes'] = num
-                        elif 'comment' in label and stats['Comments'] == "N/A":
-                            stats['Comments'] = num
-                    if all(v != "N/A" for v in stats.values()):
-                        break
-
-            return stats
-
-        except Exception as e:
-            print(f"      [Error: {e}]")
-            return {"Reads": "Error", "Votes": "Error", "Comments": "Error"}
-
-    # ------------------------------------------------------------------
-    # Local chapter test
-    # ------------------------------------------------------------------
-
-    def run_local_chapter_test(self, local_file_path, extract_text=False):
-        print(f"\n{'='*70}")
-        print(f"TESTING LOCAL CHAPTER: {local_file_path}")
-        print(f"{'='*70}")
-
-        abs_path = os.path.abspath(local_file_path)
-        if not os.path.exists(abs_path):
-            print(f"[ERROR] File not found: {abs_path}")
-            return
-
-        file_url = f"file://{abs_path}"
-        stats = self.scrape_chapter_stats(file_url, extract_text=extract_text)
-
-        print(f"\n{'='*70}")
-        print("EXTRACTION RESULTS")
-        print(f"{'='*70}")
-        print(f"  Reads:    {stats['Reads']}")
-        print(f"  Votes:    {stats['Votes']}")
-        print(f"  Comments: {stats['Comments']}")
-
-        if extract_text and 'Chapter_Text' in stats:
-            print(f"\n{'='*70}")
-            print("CHAPTER TEXT (First 500 chars)")
-            print(f"{'='*70}")
-            print(stats['Chapter_Text'][:500] + "...")
-            print(f"\nTotal characters: {len(stats['Chapter_Text'])}")
-
-        print(f"{'='*70}")
-
-    # ------------------------------------------------------------------
-    # Metadata & chapter list parsers
-    # ------------------------------------------------------------------
+    # ── parsers ──────────────────────────────────────────────────────────────
 
     def parse_metadata_bs4(self, html_content, url):
         soup = BeautifulSoup(html_content, 'html.parser')
 
-        # Title
         title = "Unknown"
-        title_tag = soup.find('h1') or soup.select_one('.story-info h1') or soup.select_one('[class*="title"]')
+        title_tag = (soup.find('h1') or
+                     soup.select_one('.story-info h1') or
+                     soup.select_one('[class*="title"]'))
         if title_tag:
             title = title_tag.get_text(strip=True)
         else:
-            m = re.search(r'/story/\d+-([^?]+)', url)
-            if m:
+            match = re.search(r'/story/\d+-([^?]+)', url)
+            if match:
                 from urllib.parse import unquote
-                title = unquote(m.group(1)).replace('-', ' ')
+                title = unquote(match.group(1)).replace('-', ' ')
 
-        # Author
         author = "Unknown"
         for a in soup.find_all('a', href=re.compile(r'^/user/')):
-            cls = str(a.get('class', '')).lower()
-            if 'avatar' not in cls and 'profile' not in cls:
-                t = a.get_text(strip=True)
-                if t and len(t) > 1 and t.lower() not in ['wattpad', 'home']:
-                    author = t
+            class_str = str(a.get('class', '')).lower()
+            if 'avatar' not in class_str and 'profile' not in class_str:
+                text = a.get_text(strip=True)
+                if text and len(text) > 1 and text.lower() not in ['wattpad', 'home']:
+                    author = text
                     break
         if author == "Unknown":
-            pt = soup.find('title')
-            if pt:
-                parts = pt.get_text(strip=True).split('-')
+            page_title = soup.find('title')
+            if page_title:
+                parts = page_title.get_text(strip=True).split('-')
                 if len(parts) >= 3:
-                    pa = parts[-2].strip()
-                    if pa.lower() != "wattpad":
-                        author = pa
+                    possible = parts[-2].strip()
+                    if possible.lower() != "wattpad":
+                        author = possible
 
-        # Description
         desc = ""
-        desc_tag = soup.find('pre') or soup.select_one('.description') or soup.select_one('.story-description')
+        desc_tag = (soup.find('pre') or
+                    soup.select_one('.description') or
+                    soup.select_one('.story-description'))
         if desc_tag:
             desc = desc_tag.get_text("\n", strip=True)
 
-        # Stats
-        reads = votes = parts_count = "0"
+        reads = votes = parts = "0"
         for span in soup.find_all('span', class_='sr-only'):
-            t = span.get_text(strip=True)
-            rm = re.search(r'Reads?\s+([\d,]+)', t, re.IGNORECASE)
-            vm = re.search(r'Votes?\s+([\d,]+)', t, re.IGNORECASE)
-            pm = re.search(r'Parts?\s+(\d+)', t, re.IGNORECASE)
+            text = span.get_text(strip=True)
+            rm = re.search(r'Reads?\s+([\d,]+)', text, re.IGNORECASE)
+            vm = re.search(r'Votes?\s+([\d,]+)', text, re.IGNORECASE)
+            pm = re.search(r'Parts?\s+(\d+)',    text, re.IGNORECASE)
             if rm: reads = rm.group(1).replace(',', '')
             if vm: votes = vm.group(1).replace(',', '')
-            if pm: parts_count = pm.group(1)
+            if pm: parts = pm.group(1)
 
         if reads == "0" or votes == "0":
-            num_re = r'([\d,]+(?:\.\d+)?\s*[KMB]?)'
+            num_regex = r'([\d,]+(?:\.\d+)?\s*[KMB]?)'
             for el in soup.find_all(attrs={"aria-label": True}):
                 label = el['aria-label'].lower()
-                vm = re.search(num_re, label, re.IGNORECASE)
-                if vm:
-                    num = vm.group(1).replace(' ', '').replace(',', '')
+                val_match = re.search(num_regex, label, re.IGNORECASE)
+                if val_match:
+                    num = val_match.group(1).replace(' ', '').replace(',', '')
                     if 'read' in label and reads == "0": reads = num
                     elif 'vote' in label and votes == "0": votes = num
-                    elif 'part' in label and parts_count == "0": parts_count = num
+                    elif 'part' in label and parts == "0": parts = num
 
-        # Tags
         tags = []
         for t in soup.find_all('a', class_=re.compile(r'pill__')):
-            txt = t.get_text(strip=True)
-            if txt:
-                tags.append(txt)
+            tag_text = t.get_text(strip=True)
+            if tag_text:
+                tags.append(tag_text)
         if not tags:
             for t in soup.select('a[href*="/stories/"]'):
-                cls = str(t.get('class', ''))
-                if 'tag' in cls or 'pill' in cls:
+                class_str = str(t.get('class', ''))
+                if 'tag' in class_str or 'pill' in class_str:
                     tags.append(t.get_text(strip=True))
 
         return {
-            "Story_ID": url.split('/')[-1].split('-')[0] if '/' in url and '-' in url else "Unknown",
-            "Title": self.normalize_text(title).title(),
-            "Author": self.normalize_text(author),
+            "Story_ID":    url.split('/')[-1].split('-')[0] if '/' in url and '-' in url else "Unknown",
+            "Title":       self.normalize_text(title).title(),
+            "Author":      self.normalize_text(author),
             "Description": self.normalize_text(desc),
             "Total_Reads": reads,
             "Total_Votes": votes,
-            "Total_Parts": parts_count,
-            "Tags": " | ".join(tags[:15]),
-            "Story_URL": url
+            "Total_Parts": parts,
+            "Tags":        " | ".join(tags[:15]),
+            "Story_URL":   url
         }
 
     def parse_chapters_bs4(self, html_content):
@@ -469,9 +476,9 @@ class WattpadScraperV5:
                 if full_url not in seen_urls and title:
                     seen_urls.add(full_url)
                     chapters.append({
-                        "Order": len(chapters) + 1,
-                        "Title": self.normalize_text(title),
-                        "URL": full_url,
+                        "Order":          len(chapters) + 1,
+                        "Title":          self.normalize_text(title),
+                        "URL":            full_url,
                         "Published_Date": date
                     })
 
@@ -487,200 +494,319 @@ class WattpadScraperV5:
                     date = "Unknown"
                     parent = link.find_parent('li') or link.find_parent('div')
                     if parent:
-                        pt = parent.get_text(" ", strip=True)
-                        dm = re.search(r'([A-Z][a-z]{2},\s+[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', pt)
-                        if not dm:
-                            dm = re.search(r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', pt)
-                        if dm:
-                            date = dm.group(1)
+                        parent_text = parent.get_text(" ", strip=True)
+                        date_match = re.search(r'([A-Z][a-z]{2},\s+[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', parent_text)
+                        if not date_match:
+                            date_match = re.search(r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', parent_text)
+                        if date_match:
+                            date = date_match.group(1)
                     seen_urls.add(full_url)
                     chapters.append({
-                        "Order": len(chapters) + 1,
-                        "Title": self.normalize_text(text),
-                        "URL": full_url,
+                        "Order":          len(chapters) + 1,
+                        "Title":          self.normalize_text(text),
+                        "URL":            full_url,
                         "Published_Date": date
                     })
 
         return chapters
 
-    # ------------------------------------------------------------------
-    # Main run
-    # ------------------------------------------------------------------
+    # ── parallel chapter scraping ─────────────────────────────────────────────
 
-    def run(self, url, local_file_path=None):
+    def _run_parallel_chapter_scrape(self, chapters, story_title):
+        print(f"\n{'='*70}")
+        print(f"PARALLEL SCRAPING: {len(chapters)} chapters | "
+              f"{self.num_workers} workers | '{story_title}'")
+        if self.should_extract_text:
+            print("  (Text extraction enabled — scroll-to-load per chapter)")
+        print(f"{'='*70}")
+
+        tasks = [(ch, self.should_extract_text) for ch in chapters]
+        start_time = time.time()
+
+        ctx = multiprocessing.get_context('spawn')
+        with ctx.Pool(
+            processes=self.num_workers,
+            initializer=_worker_init,
+            initargs=(self.headless,)
+        ) as pool:
+            results = pool.map(_scrape_chapter_task, tasks)
+
+        elapsed = time.time() - start_time
+        print(f"\n  ✓ Scraped in {elapsed:.1f}s "
+              f"({elapsed/max(len(chapters),1):.1f}s avg per chapter)")
+
+        results.sort(key=lambda x: x.get('Order', 0))
+        return results
+
+    # ── output saving ─────────────────────────────────────────────────────────
+
+    def _save_story_outputs(self, story_meta, chapters, story_dir):
+        """
+        Saves all outputs inside story_dir:
+          story_metadata.csv
+          chapters_metadata.csv
+          FULL_STORY.txt
+          chapters/
+            01 - Title.txt
+            02 - Title.txt
+            ...
+        """
+        os.makedirs(story_dir, exist_ok=True)
+
+        # ── CSVs ──────────────────────────────────────────────────────────────
+        df_story    = pd.DataFrame([story_meta])
+        df_chapters = pd.DataFrame(chapters)
+
+        df_story.to_csv(
+            os.path.join(story_dir, "story_metadata.csv"),
+            index=False, encoding='utf-8-sig'
+        )
+        df_chapters.to_csv(
+            os.path.join(story_dir, "chapters_metadata.csv"),
+            index=False, encoding='utf-8-sig'
+        )
+        print(f"  ✓ story_metadata.csv")
+        print(f"  ✓ chapters_metadata.csv")
+
+        if not self.should_extract_text or 'Chapter_Text' not in df_chapters.columns:
+            return  # nothing more to write
+
+        # ── Individual chapter .txt files ─────────────────────────────────────
+        chapters_dir = os.path.join(story_dir, "chapters")
+        os.makedirs(chapters_dir, exist_ok=True)
+        saved_individually = 0
+
+        for idx, row in df_chapters.iterrows():
+            text = row.get('Chapter_Text', '')
+            if not pd.notna(text) or not text:
+                continue
+            ch_title   = row.get('Title', f"Chapter {idx+1}")
+            safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', ch_title).strip()[:100]
+            filename   = f"{idx+1:02d} - {safe_title}.txt"
+            filepath   = os.path.join(chapters_dir, filename)
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"{ch_title}\n")
+                f.write("=" * len(ch_title) + "\n\n")
+                f.write(text)
+            saved_individually += 1
+
+        print(f"  ✓ {saved_individually} individual chapter files → chapters/")
+
+        # ── FULL_STORY.txt  (pure story text — no metadata) ──────────────────
+        chapters_with_text = [
+            row for _, row in df_chapters.iterrows()
+            if pd.notna(row.get('Chapter_Text', '')) and row.get('Chapter_Text', '')
+        ]
+
+        full_story_path = os.path.join(story_dir, "FULL_STORY.txt")
+        with open(full_story_path, 'w', encoding='utf-8') as f:
+            for row in chapters_with_text:
+                f.write(row.get('Chapter_Text', ''))
+                f.write('\n\n')
+
+        total_chars = sum(len(row.get('Chapter_Text', '')) for row in chapters_with_text)
+        print(f"  ✓ FULL_STORY.txt  ({total_chars:,} chars, "
+              f"{len(chapters_with_text)} chapters combined)")
+
+    # ── single story runner ───────────────────────────────────────────────────
+
+    def _run_single_story(self, url):
+        """Scrapes one story and saves outputs to outputs/<story title>/"""
+        print(f"\n{'='*70}")
+        print(f"SCRAPING: {url}")
+        print(f"{'='*70}")
+
+        self._main_driver.get(url)
+        time.sleep(5)
+        self._load_page_content()
+        html_source = self._main_driver.page_source
+
+        print("\n  Parsing metadata...")
+        story_meta = self.parse_metadata_bs4(html_source, url)
+
+        print("  Parsing chapter list...")
+        chapters = self.parse_chapters_bs4(html_source)
+        print(f"  Found {len(chapters)} chapters.")
+
+        if chapters:
+            story_meta['Total_Parts'] = str(len(chapters))
+
+        # Build output folder from story title
+        folder_name = _make_safe_folder_name(story_meta['Title'])
+        story_dir   = os.path.join("outputs", folder_name)
+
+        print(f"\n  Title:   {story_meta['Title']}")
+        print(f"  Author:  {story_meta['Author']}")
+        print(f"  Reads:   {story_meta['Total_Reads']}")
+        print(f"  Votes:   {story_meta['Total_Votes']}")
+        print(f"  Parts:   {story_meta['Total_Parts']}")
+        print(f"  Folder:  {story_dir}")
+
+        return story_meta, chapters, story_dir
+
+    # ── public entry point ────────────────────────────────────────────────────
+
+    def run(self, urls: list):
+        """
+        Scrapes one or more story URLs sequentially (story pages),
+        with parallel chapter scraping within each story.
+
+        Args:
+            urls: list of Wattpad story URLs
+        """
+        urls = [u.strip() for u in urls if u.strip()]
+        if not urls:
+            print("[ERROR] No URLs provided.")
+            return
+
+        print(f"\n{'='*70}")
+        print(f"WATTPAD MULTI-STORY SCRAPER  —  {len(urls)} story/stories")
+        print(f"{'='*70}")
+
+        all_story_meta = []
+
         try:
-            html_source = ""
+            for story_num, url in enumerate(urls, 1):
+                print(f"\n[Story {story_num}/{len(urls)}]")
 
-            if local_file_path:
-                print(f"\n{'='*70}")
-                print(f"LOADING LOCAL STORY: {local_file_path}")
-                print(f"{'='*70}")
-                abs_path = os.path.abspath(local_file_path)
-                self.driver.get(f"file://{abs_path}")
-                time.sleep(5)
-                html_source = self.driver.page_source
-                print("✓ Local file loaded.")
-            else:
-                print(f"\n{'='*70}")
-                print(f"SCRAPING URL: {url}")
-                print(f"{'='*70}")
-                self.driver.get(url)
-                time.sleep(5)
-                self._load_page_content()
-                html_source = self.driver.page_source
+                story_meta, chapters, story_dir = self._run_single_story(url)
 
-            print("\nAnalyzing Metadata...")
-            story_meta = self.parse_metadata_bs4(html_source, url)
+                if self.should_scrape_stats and chapters:
+                    # Quit main driver before spawning workers to free memory
+                    self._main_driver.quit()
+                    self._main_driver = None
 
-            print("\nAnalyzing Chapters...")
-            chapters = self.parse_chapters_bs4(html_source)
-            print(f"  Found {len(chapters)} chapters.")
-
-            if len(chapters) > 0:
-                story_meta['Total_Parts'] = str(len(chapters))
-
-            print(f"\n{'='*70}")
-            print("STORY METADATA")
-            print(f"{'='*70}")
-            print(f"  Title:       {story_meta['Title']}")
-            print(f"  Author:      {story_meta['Author']}")
-            print(f"  Reads:       {story_meta['Total_Reads']}")
-            print(f"  Votes:       {story_meta['Total_Votes']}")
-            print(f"  Parts:       {story_meta['Total_Parts']}")
-            print(f"  Description: {story_meta['Description'][:100]}...")
-            print(f"  Tags:        {story_meta['Tags'][:80]}...")
-            print(f"{'='*70}")
-
-            story_safe_name = self.safe_filename(story_meta['Title']) or "story"
-
-            if self.should_scrape_stats and chapters and not local_file_path:
-                print(f"\n{'='*70}")
-                print(f"SCRAPING CHAPTER STATS + TEXT (all pages per chapter)")
-                print(f"{'='*70}")
-
-                for i, chapter in enumerate(chapters, 1):
-                    print(f"\n  [{i}/{len(chapters)}] {chapter['Title'][:50]}")
-
-                    if i > 1 and i % 10 == 0:
-                        self.driver.quit()
-                        self._init_driver()
-                        time.sleep(1)
-
-                    stats = self.scrape_chapter_stats(
-                        chapter['URL'], extract_text=self.should_extract_text
+                    chapters = self._run_parallel_chapter_scrape(
+                        chapters, story_meta['Title']
                     )
-                    chapter.update(stats)
-                    print(f"  ✓ Reads:{stats['Reads']}  Votes:{stats['Votes']}  Comments:{stats['Comments']}")
 
-                    if i % 5 == 0:
-                        pd.DataFrame(chapters).to_csv(
-                            f"{story_safe_name}_chapters_progress.csv", index=False
-                        )
+                    # Restart main driver for the next story (if any remaining)
+                    if story_num < len(urls):
+                        print("\n  Restarting main driver for next story...")
+                        self._main_driver = self._make_driver(headless=False)
 
-            print(f"\n{'='*70}")
-            print("SAVING RESULTS")
-            print(f"{'='*70}")
-
-            df_story    = pd.DataFrame([story_meta])
-            df_chapters = pd.DataFrame(chapters)
-
-            suffix      = "_local" if local_file_path else "_complete"
-            story_csv   = f"{story_safe_name}_metadata{suffix}.csv"
-            chapter_csv = f"{story_safe_name}_chapters{suffix}.csv"
-
-            df_story.to_csv(story_csv,   index=False, encoding='utf-8-sig')
-            df_chapters.to_csv(chapter_csv, index=False, encoding='utf-8-sig')
-            print(f"✓ Saved: {story_csv}")
-            print(f"✓ Saved: {chapter_csv}")
-
-            if self.should_extract_text and 'Chapter_Text' in df_chapters.columns:
-                print(f"\nSaving individual chapter text files...")
-                text_dir = story_safe_name          # folder named after the story
-                os.makedirs(text_dir, exist_ok=True)
-
-                saved_count = 0
-                for idx, row in df_chapters.iterrows():
-                    if pd.notna(row.get('Chapter_Text')) and row['Chapter_Text']:
-                        title     = row.get('Title', f"Chapter {idx+1}")
-                        safe_t    = re.sub(r'[<>:"/\\|?*]', '', title).strip()[:100]
-                        filename  = f"{idx+1:02d} - {safe_t}.txt"
-                        filepath  = os.path.join(text_dir, filename)
-                        with open(filepath, 'w', encoding='utf-8') as f:
-                            f.write(row['Chapter_Text'])
-                        saved_count += 1
-
-                print(f"✓ Saved {saved_count} chapter text files to '{text_dir}/' folder")
-
-            print(f"{'='*70}")
-            print("✓ SCRAPING COMPLETE!")
+                print(f"\n  Saving outputs to: {story_dir}/")
+                self._save_story_outputs(story_meta, chapters, story_dir)
+                all_story_meta.append(story_meta)
 
         except Exception as e:
             print(f"\n[ERROR] {e}")
             import traceback
             traceback.print_exc()
+
         finally:
-            if self.driver:
-                self.driver.quit()
+            if self._main_driver:
+                try:
+                    self._main_driver.quit()
+                except Exception:
+                    pass
+
+        # ── Summary CSV across all stories ────────────────────────────────────
+        if all_story_meta:
+            os.makedirs("outputs", exist_ok=True)
+            summary_path = os.path.join("outputs", "all_stories_summary.csv")
+            pd.DataFrame(all_story_meta).to_csv(
+                summary_path, index=False, encoding='utf-8-sig'
+            )
+            print(f"\n{'='*70}")
+            print(f"ALL DONE — {len(all_story_meta)} story/stories scraped")
+            print(f"Summary saved to: {summary_path}")
+            print(f"{'='*70}")
+            for meta in all_story_meta:
+                folder = _make_safe_folder_name(meta['Title'])
+                print(f"  • outputs/{folder}/")
 
 
-# ======================================================================
-# Entry point
-# ======================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_urls_from_file(filepath: str) -> list:
+    """
+    Reads URLs from a plain text file — one URL per line.
+    Ignores blank lines and lines starting with # (comments).
+    """
+    filepath = filepath.strip().strip('"').strip("'")
+    if not os.path.exists(filepath):
+        print(f"  [ERROR] File not found: {filepath}")
+        return []
+    urls = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                urls.append(line)
+    return urls
+
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
     print("=" * 70)
-    print("WATTPAD SCRAPER V5.0 — Multi-Page Chapter Support")
+    print("WATTPAD SCRAPER V5.1 — Multi-URL + Parallel + Per-Story Folders")
     print("=" * 70)
-    print("1. Scrape Live URL (Metadata + Chapters)")
-    print("2. Scrape Live URL (Metadata + Chapters + Stats)")
-    print("3. Scrape Live URL (Full: Metadata + Chapters + Stats + TEXT)")
-    print("4. Test on LOCAL FILE (Story Overview)")
-    print("5. Test on LOCAL FILE (Single Chapter Stats)")
-    print("6. Test on LOCAL FILE (Single Chapter Stats + Text)")
+    print()
+    print("Modes:")
+    print("  1. Metadata + Chapters only  (no chapter page visits)")
+    print("  2. Metadata + Chapters + Stats  (parallel)")
+    print("  3. Metadata + Chapters + Stats + Full TEXT  (parallel)")
+    print()
 
-    choice = input("\nEnter choice (1-6): ").strip()
+    choice = input("Enter choice (1/2/3): ").strip()
 
-    url          = "https://www.wattpad.com/story/353975883-homecoming"
-    local_file   = None
-    scrape_stats = False
-    extract_text = False
+    # ── URL input method ──────────────────────────────────────────────────────
+    print()
+    print("URL source:")
+    print("  F. Load from a .txt file  (one URL per line, # for comments)")
+    print("  M. Enter URLs manually")
+    print()
 
-    if choice == '4':
-        local_file = input("Enter Story .mhtml filename: ").strip().strip('"')
-        if os.path.exists(local_file):
-            scraper = WattpadScraperV5(headless=False, scrape_chapter_stats=False)
-            scraper.run(url, local_file_path=local_file)
+    url_source = input("Enter choice (F/M): ").strip().upper()
+
+    urls = []
+
+    if url_source == 'F':
+        txt_path = input("\nEnter path to .txt file: ").strip().strip('"').strip("'")
+        urls = _load_urls_from_file(txt_path)
+        if urls:
+            print(f"\n  ✓ Loaded {len(urls)} URL(s) from '{txt_path}':")
+            for i, u in enumerate(urls, 1):
+                print(f"    {i}. {u}")
         else:
-            print("File not found.")
+            print("  No valid URLs found in file.")
 
-    elif choice == '5':
-        local_file = input("Enter Chapter .mhtml filename: ").strip().strip('"')
-        if os.path.exists(local_file):
-            scraper = WattpadScraperV5(headless=False, scrape_chapter_stats=True)
-            scraper.run_local_chapter_test(local_file, extract_text=False)
-        else:
-            print("File not found.")
+    else:  # Manual entry
+        print()
+        print("Enter Wattpad story URLs (one per line, blank line when done):")
+        print()
+        while True:
+            line = input("  URL: ").strip().strip('"').strip("'")
+            if not line:
+                break
+            urls.append(line)
 
-    elif choice == '6':
-        local_file = input("Enter Chapter .mhtml filename: ").strip().strip('"')
-        if os.path.exists(local_file):
-            scraper = WattpadScraperV5(headless=False, scrape_chapter_stats=True,
-                                       extract_chapter_text=True)
-            scraper.run_local_chapter_test(local_file, extract_text=True)
-        else:
-            print("File not found.")
+    if not urls:
+        # Fallback demo URL
+        urls = ["https://www.wattpad.com/story/353975883-homecoming"]
+        print(f"\nNo URLs provided — using demo: {urls[0]}")
 
-    else:
-        url_input = input("Enter Wattpad story URL (press Enter for default): ").strip()
-        if url_input:
-            url = url_input
+    # ── Worker count ──────────────────────────────────────────────────────────
+    workers_input = input("\nNumber of parallel workers per story (Enter for 3): ").strip()
+    num_workers   = int(workers_input) if workers_input.isdigit() else 3
 
-        if choice == '2':
-            scrape_stats = True
-        elif choice == '3':
-            scrape_stats = True
-            extract_text = True
+    scrape_stats = choice in ('2', '3')
+    extract_text = choice == '3'
 
-        scraper = WattpadScraperV5(headless=False, scrape_chapter_stats=scrape_stats,
-                                   extract_chapter_text=extract_text)
-        scraper.run(url)
+    print(f"\n{'='*70}")
+    print(f"  Stories   : {len(urls)}")
+    print(f"  Mode      : {'Stats + Text' if extract_text else 'Stats only' if scrape_stats else 'Metadata only'}")
+    print(f"  Workers   : {num_workers} parallel Chrome instances per story")
+    print(f"{'='*70}\n")
+
+    scraper = WattpadScraperV5Parallel(
+        headless=True,
+        scrape_chapter_stats=scrape_stats,
+        extract_chapter_text=extract_text,
+        num_workers=num_workers
+    )
+    scraper.run(urls)

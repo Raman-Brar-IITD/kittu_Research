@@ -116,32 +116,43 @@ class WattpadScraperV3:
 
     def _scroll_to_load_full_chapter(self):
         """
-        Scrolls the chapter page slowly until no new paragraphs appear.
-        Wattpad lazy-loads paginated content via scroll — this replaces
-        the rel=next URL navigation which caused duplicate extraction
-        because /page/2 DOM already includes page 1 paragraphs.
+        Stable scroll logic:
+        - Uses polling instead of WebDriverWait
+        - Keeps small sleep for JS execution
+        - Detects real content growth reliably
         """
         print(f"      → Scrolling to load full chapter...")
+
         last_count = 0
         stall_attempts = 0
-        max_stalls = 3  # Stop after 3 scrolls with no new paragraphs
+        max_stalls = 3
 
         while stall_attempts < max_stalls:
             # Scroll to bottom
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2.5)
 
-            # Count current paragraphs in DOM
-            current_count = self.driver.execute_script(
-                "return document.querySelectorAll('p[data-p-id]').length;"
-            )
+            # Give JS time to trigger loading
+            time.sleep(1.2)
 
-            if current_count > last_count:
-                print(f"      → {current_count} paragraphs loaded so far...")
-                last_count = current_count
-                stall_attempts = 0  # Reset on progress
-            else:
+            # Poll for new content (instead of fixed long sleep)
+            new_loaded = False
+            for _ in range(5):  # ~2 seconds max wait
+                current_count = self.driver.execute_script(
+                    "return document.querySelectorAll('p[data-p-id]').length;"
+                )
+
+                if current_count > last_count:
+                    print(f"      → {current_count} paragraphs loaded so far...")
+                    last_count = current_count
+                    stall_attempts = 0
+                    new_loaded = True
+                    break
+
+                time.sleep(0.4)
+
+            if not new_loaded:
                 stall_attempts += 1
+                print(f"      → No new content (stall {stall_attempts}/{max_stalls})")
 
         print(f"      → Full chapter loaded: {last_count} paragraphs total.")
 
