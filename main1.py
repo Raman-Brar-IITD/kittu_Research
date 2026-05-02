@@ -5,6 +5,9 @@ import os
 import copy
 import unicodedata
 import multiprocessing
+import requests
+import csv
+import atexit
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -14,11 +17,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE-LEVEL WORKER STATE
-# Each worker process gets its own Chrome driver via the initializer.
-# Globals are safe here because multiprocessing gives each worker its own
-# memory space — there is no shared state between workers.
 # ─────────────────────────────────────────────────────────────────────────────
 _worker_driver = None
+
+_CHAPTER_PATH_RE = re.compile(r'^/(\d{6,})-[\w-]+$')
 
 
 def _worker_init(headless: bool):
@@ -48,28 +50,120 @@ def _worker_init(headless: bool):
     _worker_driver.execute_script(
         "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
+    # Register cleanup so Chrome quits when this worker process exits
+    atexit.register(_worker_cleanup)
+
+
+def _worker_cleanup():
+    """Quit the worker-process Chrome instance on process exit."""
+    global _worker_driver
+    if _worker_driver is not None:
+        try:
+            _worker_driver.quit()
+            print(f"    [PID {os.getpid()}] Chrome closed.")
+        except Exception:
+            pass
+        _worker_driver = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STATELESS HELPER FUNCTIONS  (picklable — safe to use in worker processes)
+# STATELESS HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_safe_folder_name(name: str) -> str:
-    """
-    Converts a story title into a safe folder name.
-    - Strips characters invalid on Windows/macOS/Linux
-    - Collapses whitespace
-    - Limits to 80 chars to avoid path-length issues
-    """
     safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
-    safe = re.sub(r'\s+', ' ', safe).strip()
-    safe = safe.strip('. ')          # Windows dislikes leading/trailing dots
+    safe = re.sub(r'\s+', ' ', safe).strip().strip('. ')
     return safe[:80] if safe else "Unknown_Story"
 
 
+def _make_safe_filename(name: str, max_len: int = 80) -> str:
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name)
+    safe = re.sub(r'\s+', ' ', safe).strip().strip('. ')
+    return safe[:max_len] if safe else "Unknown"
+
+
+def _is_valid_chapter_url(url: str) -> bool:
+    if not re.match(r'https?://(?:www\.)?wattpad\.com/', url):
+        return False
+    path_match = re.match(r'https?://[^/]+(/.+)', url)
+    if not path_match:
+        return False
+    path = path_match.group(1)
+    return bool(_CHAPTER_PATH_RE.match(path))
+
+
+def _extract_part_id(url: str) -> str:
+    match = re.search(r'/(\d{6,})-', url)
+    return match.group(1) if match else None
+
+
+def _fetch_comments_for_chapter(part_id: str, cookies: dict = None) -> list:
+    if not part_id:
+        return []
+
+    base_url = (
+        f"https://www.wattpad.com/v5/comments/namespaces/parts"
+        f"/resources/{part_id}/comments"
+    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json"
+    }
+
+    all_comments = []
+    cursor = None
+    page = 0
+
+    while True:
+        params = {}
+        if cursor:
+            params["after"] = cursor
+
+        try:
+            resp = requests.get(
+                base_url, headers=headers, params=params,
+                cookies=cookies, timeout=15
+            )
+            data = resp.json()
+        except Exception as e:
+            print(f"      [Comments] Fetch error (part {part_id}): {e}")
+            break
+
+        batch = data.get("comments", [])
+        all_comments.extend(batch)
+        page += 1
+        print(f"      [Comments] Part {part_id} — page {page}: {len(batch)} comments")
+
+        cursor_obj = data.get("pagination", {}).get("after")
+        cursor = cursor_obj.get("resourceId") if cursor_obj else None
+
+        if not cursor:
+            break
+
+        time.sleep(1)
+
+    return all_comments
+
+
+def _parse_comment(raw: dict, chapter_order: int, chapter_title: str,
+                   part_id: str) -> dict:
+    return {
+        "chapter_order":  chapter_order,
+        "chapter_title":  chapter_title,
+        "part_id":        part_id,
+        "user":           raw.get("user", {}).get("name", ""),
+        "text":           raw.get("text", ""),
+        "likes":          raw.get("sentiments", {}).get(":like:", {}).get("count", 0),
+        "replies":        raw.get("replyCount", 0),
+        "created":        raw.get("created", "")
+    }
+
+
 def _scroll_to_load_full_chapter(driver):
-    """Scrolls until no new paragraphs appear."""
-    print(f"      → Scrolling to load full chapter...")
+    print(f"      -> Scrolling to load full chapter...")
     last_count = 0
     stall_attempts = 0
     max_stalls = 3
@@ -81,17 +175,16 @@ def _scroll_to_load_full_chapter(driver):
             "return document.querySelectorAll('p[data-p-id]').length;"
         )
         if current_count > last_count:
-            print(f"      → {current_count} paragraphs loaded so far...")
+            print(f"      -> {current_count} paragraphs loaded so far...")
             last_count = current_count
             stall_attempts = 0
         else:
             stall_attempts += 1
 
-    print(f"      → Full chapter loaded: {last_count} paragraphs total.")
+    print(f"      -> Full chapter loaded: {last_count} paragraphs total.")
 
 
 def _extract_chapter_text(soup):
-    """Extracts story text. Must be called BEFORE any decompose() operations."""
     text_content = []
     paragraphs = soup.find_all('p', attrs={'data-p-id': True})
 
@@ -125,10 +218,8 @@ def _extract_chapter_text(soup):
 
 
 def _scrape_stats_from_soup(soup):
-    """Extracts Reads/Votes/Comments from a chapter page soup."""
     stats = {"Reads": "N/A", "Votes": "N/A", "Comments": "N/A"}
 
-    # Noise removal
     for noise in soup.find_all(
         ['div', 'section', 'aside'],
         class_=re.compile(r'recommend|sidebar|next-up|story-list|similar|related|footer|you-may-also')
@@ -140,7 +231,6 @@ def _scrape_stats_from_soup(soup):
             if len(text) < 500:
                 div.decompose()
 
-    # Method 1: story-stats div
     stats_div = soup.find('div', class_='story-stats')
     if stats_div:
         reads_span = stats_div.find('span', class_='reads')
@@ -163,7 +253,6 @@ def _scrape_stats_from_soup(soup):
             if m:
                 stats['Comments'] = m.group(1).replace(',', '')
 
-    # Method 2: sr-only spans
     if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
         main_area = soup.find('div', id='story-reading') or soup.find('article') or soup
         for span in main_area.find_all('span', class_='sr-only'):
@@ -177,7 +266,6 @@ def _scrape_stats_from_soup(soup):
             if all(v != "N/A" for v in stats.values()):
                 break
 
-    # Method 3: data-toggle tooltip
     if stats['Reads'] == "N/A":
         header = soup.find('header') or soup.find('div', class_=re.compile(r'story-info|chapter-info'))
         area = header if header else soup
@@ -189,7 +277,6 @@ def _scrape_stats_from_soup(soup):
                     stats['Reads'] = m.group(1).replace(',', '')
                     break
 
-    # Method 4: aria-label
     if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
         num_regex = r'([\d,]+(?:\.\d+)?\s*[KMB]?)'
         main_content = soup.find('div', id='story-reading') or soup.find('article') or soup
@@ -204,7 +291,6 @@ def _scrape_stats_from_soup(soup):
             if all(v != "N/A" for v in stats.values()):
                 break
 
-    # Method 5: visible meta text
     if stats['Reads'] == "N/A" or stats['Votes'] == "N/A":
         main_content = soup.find('div', id='story-reading') or soup.find('article')
         if main_content:
@@ -228,26 +314,26 @@ def _scrape_stats_from_soup(soup):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WORKER TASK  (top-level — required for multiprocessing pickling)
+# WORKER TASK
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_chapter_task(args):
-    """
-    Executed in a worker process for a single chapter.
-
-    Args:
-        args: tuple of (chapter_dict, extract_text: bool)
-
-    Returns:
-        chapter_dict updated with stats and optionally Chapter_Text.
-    """
     global _worker_driver
-    chapter, extract_text = args
+    chapter, extract_text, scrape_comments, cookies = args
     url = chapter['URL']
+
+    if not _is_valid_chapter_url(url):
+        print(f"    [SKIP] Not a valid chapter URL: {url[:65]}")
+        chapter.update({"Reads": "Skipped", "Votes": "Skipped", "Comments": "Skipped"})
+        if extract_text:
+            chapter['Chapter_Text'] = ""
+        if scrape_comments:
+            chapter['raw_comments'] = []
+        return chapter
 
     try:
         pid = os.getpid()
-        print(f"    [PID {pid}] Scanning: {url[:55]}...")
+        print(f"    [PID {pid}] Scanning: {url[:65]}...")
         _worker_driver.get(url)
         time.sleep(3)
 
@@ -264,14 +350,27 @@ def _scrape_chapter_task(args):
         stats = _scrape_stats_from_soup(soup)
         chapter.update(stats)
 
-        print(f"    [PID {pid}] ✓ {chapter['Title'][:30]:30} "
+        print(f"    [PID {pid}] + {chapter['Title'][:30]:30} "
               f"R:{stats['Reads']:>6} V:{stats['Votes']:>4} C:{stats['Comments']:>4}")
 
+        if scrape_comments:
+            part_id = _extract_part_id(url)
+            if part_id:
+                print(f"    [PID {pid}] Fetching comments for part {part_id}...")
+                raw_comments = _fetch_comments_for_chapter(part_id, cookies=cookies)
+                chapter['raw_comments'] = raw_comments
+                print(f"    [PID {pid}] + {len(raw_comments)} comments fetched")
+            else:
+                print(f"    [PID {pid}] ! Could not extract part_id from URL")
+                chapter['raw_comments'] = []
+
     except Exception as e:
-        print(f"    [ERROR] {url[:55]} → {e}")
+        print(f"    [ERROR] {url[:65]} -> {e}")
         chapter.update({"Reads": "Error", "Votes": "Error", "Comments": "Error"})
         if extract_text:
             chapter['Chapter_Text'] = ""
+        if scrape_comments:
+            chapter['raw_comments'] = []
 
     return chapter
 
@@ -282,28 +381,37 @@ def _scrape_chapter_task(args):
 
 class WattpadScraperV5Parallel:
     """
-    Multi-URL Parallel Wattpad scraper — v5.1
+    Multi-URL Parallel Wattpad scraper — v5.4
 
     For each story URL:
       outputs/<Story Title>/
       ├── story_metadata.csv
       ├── chapters_metadata.csv
-      ├── FULL_STORY.txt               ← all chapters combined in order
-      └── chapters/
-          ├── 01 - Chapter Title.txt
-          ├── 02 - Chapter Title.txt
-          └── ...
+      ├── all_comments.csv               <- all chapters combined (if comments enabled)
+      ├── FULL_STORY.txt                 <- all chapters combined (if text enabled)
+      ├── chapters/
+      │   ├── 01 - Chapter Title.txt
+      │   └── ...
+      └── comments/
+          ├── comments_full_data/
+          │   ├── 01 - Chapter Title-comments.csv     <- per chapter, all fields
+          │   └── complete_comments_full_data.csv     <- ALL chapters, all fields
+          └── comments_text/
+              ├── 01 - Chapter Title-comments_text.csv  <- per chapter, text only
+              └── complete_comments_text.csv            <- ALL chapters, one column per chapter
     """
 
     def __init__(self, headless=True, scrape_chapter_stats=True,
-                 extract_chapter_text=False, num_workers=3):
-        self.headless             = headless
-        self.should_scrape_stats  = scrape_chapter_stats
-        self.should_extract_text  = extract_chapter_text
-        self.num_workers          = num_workers
-        self._main_driver         = self._make_driver(headless=False)
+                 extract_chapter_text=False, scrape_comments=False,
+                 num_workers=3):
+        self.headless               = headless
+        self.should_scrape_stats    = scrape_chapter_stats
+        self.should_extract_text    = extract_chapter_text
+        self.should_scrape_comments = scrape_comments
+        self.num_workers            = num_workers
+        self._main_driver           = self._make_driver(headless=False)
 
-    # ── driver factory ───────────────────────────────────────────────────────
+    # ── driver factory ────────────────────────────────────────────────────────
 
     def _make_driver(self, headless=False):
         options = Options()
@@ -332,7 +440,17 @@ class WattpadScraperV5Parallel:
         )
         return driver
 
-    # ── text helpers ─────────────────────────────────────────────────────────
+    # ── cookie extraction ─────────────────────────────────────────────────────
+
+    def _get_session_cookies(self) -> dict:
+        if not self._main_driver:
+            return {}
+        try:
+            return {c['name']: c['value'] for c in self._main_driver.get_cookies()}
+        except Exception:
+            return {}
+
+    # ── text helpers ──────────────────────────────────────────────────────────
 
     def normalize_text(self, text):
         if not text:
@@ -341,7 +459,7 @@ class WattpadScraperV5Parallel:
         ascii_text = normalized.encode('ascii', 'ignore').decode('ascii').strip()
         return re.sub(r'\s+', ' ', ascii_text)
 
-    # ── page loading ─────────────────────────────────────────────────────────
+    # ── page loading ──────────────────────────────────────────────────────────
 
     def _load_page_content(self):
         print("    ...Loading full page content...")
@@ -349,8 +467,22 @@ class WattpadScraperV5Parallel:
         for i in range(1, 6):
             self._main_driver.execute_script(f"window.scrollTo(0, {total_height * (i/5)});")
             time.sleep(0.8)
+
         try:
-            toc = self._main_driver.find_element(By.CLASS_NAME, "story-parts")
+            parts_tab = self._main_driver.find_element(By.ID, "tab-parts")
+            if parts_tab.get_attribute("aria-selected") != "true":
+                print("    ...Clicking 'Parts' tab to load chapter list...")
+                self._main_driver.execute_script("arguments[0].click();", parts_tab)
+                time.sleep(2)
+            else:
+                print("    ...'Parts' tab already active.")
+        except Exception:
+            pass
+
+        try:
+            toc = self._main_driver.find_element(
+                By.CSS_SELECTOR, "ul[aria-label='story-parts'], ul[data-testid='part-list']"
+            )
             self._main_driver.execute_script(
                 "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", toc
             )
@@ -358,6 +490,7 @@ class WattpadScraperV5Parallel:
         except Exception:
             self._main_driver.execute_script(f"window.scrollTo(0, {total_height * 0.4});")
             time.sleep(2)
+
         try:
             buttons = self._main_driver.find_elements(
                 By.XPATH, "//button[contains(text(), 'Show more') or contains(@class, 'more')]"
@@ -369,7 +502,7 @@ class WattpadScraperV5Parallel:
         except Exception:
             pass
 
-    # ── parsers ──────────────────────────────────────────────────────────────
+    # ── parsers ───────────────────────────────────────────────────────────────
 
     def parse_metadata_bs4(self, html_content, url):
         soup = BeautifulSoup(html_content, 'html.parser')
@@ -459,20 +592,61 @@ class WattpadScraperV5Parallel:
         chapters = []
         seen_urls = set()
 
-        story_parts = soup.find('ul', attrs={'aria-label': 'story-parts'})
+        story_parts = (
+            soup.find('ul', attrs={'data-testid': 'part-list'}) or
+            soup.find('ul', attrs={'aria-label': 'story-parts'})
+        )
         if story_parts:
-            for li in story_parts.find_all('li', recursive=False):
+            items = (
+                story_parts.find_all('li', attrs={'data-testid': 'part-list-item'}) or
+                story_parts.find_all('li', recursive=False)
+            )
+            for li in items:
                 link = li.find('a', href=True)
                 if not link:
                     continue
                 href = link['href']
-                if '/story/' in href or not re.search(r'/\d+-', href):
-                    continue
-                title_div = link.find('div', class_='wpYp-')
-                title = title_div.get_text(strip=True) if title_div else "Unknown"
-                date_div = link.find('div', class_='bSGSB')
-                date = date_div.get_text(strip=True) if date_div else "Unknown"
                 full_url = href if href.startswith('http') else f"https://www.wattpad.com{href}"
+
+                if not _is_valid_chapter_url(full_url):
+                    continue
+
+                title = ""
+                title_span = link.find(
+                    'span', class_=re.compile(r'typography-paragraph-medium')
+                )
+                if title_span:
+                    title = title_span.get_text(strip=True)
+                if not title:
+                    for el in link.find_all(['span', 'div', 'p']):
+                        t = el.get_text(strip=True)
+                        if (t and len(t) > 3
+                                and not re.match(r'^[\d\s%,]+$', t)
+                                and not re.search(
+                                    r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b',
+                                    t, re.IGNORECASE
+                                )):
+                            title = t
+                            break
+                if not title:
+                    title = link.get_text(strip=True)
+
+                date = "Unknown"
+                date_span = li.find(
+                    'span', class_=re.compile(r'typography-paragraph-small')
+                )
+                if date_span:
+                    date = date_span.get_text(strip=True)
+                if date == "Unknown":
+                    for el in li.find_all(['span', 'div']):
+                        t = el.get_text(strip=True)
+                        if re.search(
+                            r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b',
+                            t, re.IGNORECASE
+                        ):
+                            date = t
+                            break
+
                 if full_url not in seen_urls and title:
                     seen_urls.add(full_url)
                     chapters.append({
@@ -484,43 +658,53 @@ class WattpadScraperV5Parallel:
 
         if not chapters:
             for link in soup.find_all('a', href=True):
-                href = link['href']
-                text = link.get_text(strip=True)
-                if not re.search(r'/\d+-', href): continue
-                if '/story/' in href: continue
-                if any(x in href for x in ['/user/', '/list/', '/login', '/search', '/myworks']): continue
+                href  = link['href']
+                text  = link.get_text(strip=True)
                 full_url = href if href.startswith('http') else f"https://www.wattpad.com{href}"
-                if full_url not in seen_urls and text:
-                    date = "Unknown"
-                    parent = link.find_parent('li') or link.find_parent('div')
-                    if parent:
-                        parent_text = parent.get_text(" ", strip=True)
-                        date_match = re.search(r'([A-Z][a-z]{2},\s+[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', parent_text)
-                        if not date_match:
-                            date_match = re.search(r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', parent_text)
-                        if date_match:
-                            date = date_match.group(1)
-                    seen_urls.add(full_url)
-                    chapters.append({
-                        "Order":          len(chapters) + 1,
-                        "Title":          self.normalize_text(text),
-                        "URL":            full_url,
-                        "Published_Date": date
-                    })
+
+                if not _is_valid_chapter_url(full_url):
+                    continue
+                if full_url in seen_urls or not text:
+                    continue
+
+                date = "Unknown"
+                parent = link.find_parent('li') or link.find_parent('div')
+                if parent:
+                    parent_text = parent.get_text(" ", strip=True)
+                    date_match = re.search(
+                        r'([A-Z][a-z]{2},\s+[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', parent_text
+                    ) or re.search(
+                        r'([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})', parent_text
+                    )
+                    if date_match:
+                        date = date_match.group(1)
+
+                seen_urls.add(full_url)
+                chapters.append({
+                    "Order":          len(chapters) + 1,
+                    "Title":          self.normalize_text(text),
+                    "URL":            full_url,
+                    "Published_Date": date
+                })
 
         return chapters
 
     # ── parallel chapter scraping ─────────────────────────────────────────────
 
-    def _run_parallel_chapter_scrape(self, chapters, story_title):
+    def _run_parallel_chapter_scrape(self, chapters, story_title, cookies):
         print(f"\n{'='*70}")
         print(f"PARALLEL SCRAPING: {len(chapters)} chapters | "
               f"{self.num_workers} workers | '{story_title}'")
         if self.should_extract_text:
             print("  (Text extraction enabled — scroll-to-load per chapter)")
+        if self.should_scrape_comments:
+            print("  (Comments scraping enabled — API calls per chapter)")
         print(f"{'='*70}")
 
-        tasks = [(ch, self.should_extract_text) for ch in chapters]
+        tasks = [
+            (ch, self.should_extract_text, self.should_scrape_comments, cookies)
+            for ch in chapters
+        ]
         start_time = time.time()
 
         ctx = multiprocessing.get_context('spawn')
@@ -532,7 +716,7 @@ class WattpadScraperV5Parallel:
             results = pool.map(_scrape_chapter_task, tasks)
 
         elapsed = time.time() - start_time
-        print(f"\n  ✓ Scraped in {elapsed:.1f}s "
+        print(f"\n  + Scraped in {elapsed:.1f}s "
               f"({elapsed/max(len(chapters),1):.1f}s avg per chapter)")
 
         results.sort(key=lambda x: x.get('Order', 0))
@@ -542,20 +726,23 @@ class WattpadScraperV5Parallel:
 
     def _save_story_outputs(self, story_meta, chapters, story_dir):
         """
-        Saves all outputs inside story_dir:
-          story_metadata.csv
-          chapters_metadata.csv
-          FULL_STORY.txt
-          chapters/
-            01 - Title.txt
-            02 - Title.txt
-            ...
+        Saves all outputs inside story_dir.
+
+        comments/ folder structure:
+          comments/
+            comments_full_data/   <- chapter_order, chapter_title, part_id,
+                                     user, text, likes, replies, created
+            comments_text/        <- text column ONLY
         """
         os.makedirs(story_dir, exist_ok=True)
 
-        # ── CSVs ──────────────────────────────────────────────────────────────
+        chapters_for_csv = [
+            {k: v for k, v in ch.items() if k not in ('raw_comments', 'Chapter_Text')}
+            for ch in chapters
+        ]
+
         df_story    = pd.DataFrame([story_meta])
-        df_chapters = pd.DataFrame(chapters)
+        df_chapters = pd.DataFrame(chapters_for_csv)
 
         df_story.to_csv(
             os.path.join(story_dir, "story_metadata.csv"),
@@ -565,53 +752,151 @@ class WattpadScraperV5Parallel:
             os.path.join(story_dir, "chapters_metadata.csv"),
             index=False, encoding='utf-8-sig'
         )
-        print(f"  ✓ story_metadata.csv")
-        print(f"  ✓ chapters_metadata.csv")
-
-        if not self.should_extract_text or 'Chapter_Text' not in df_chapters.columns:
-            return  # nothing more to write
+        print(f"  + story_metadata.csv")
+        print(f"  + chapters_metadata.csv")
 
         # ── Individual chapter .txt files ─────────────────────────────────────
-        chapters_dir = os.path.join(story_dir, "chapters")
-        os.makedirs(chapters_dir, exist_ok=True)
-        saved_individually = 0
+        if self.should_extract_text:
+            chapters_dir = os.path.join(story_dir, "chapters")
+            os.makedirs(chapters_dir, exist_ok=True)
+            saved_individually = 0
 
-        for idx, row in df_chapters.iterrows():
-            text = row.get('Chapter_Text', '')
-            if not pd.notna(text) or not text:
+            for ch in chapters:
+                text = ch.get('Chapter_Text', '')
+                if not text:
+                    continue
+                ch_title   = ch.get('Title', f"Chapter {ch.get('Order', 0)}")
+                safe_title = _make_safe_filename(ch_title)
+                filename   = f"{ch.get('Order', 0):02d} - {safe_title}.txt"
+                filepath   = os.path.join(chapters_dir, filename)
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(f"{ch_title}\n")
+                    f.write("=" * len(ch_title) + "\n\n")
+                    f.write(text)
+                saved_individually += 1
+
+            print(f"  + {saved_individually} individual chapter files -> chapters/")
+
+            chapters_with_text = [ch for ch in chapters if ch.get('Chapter_Text', '')]
+            full_story_path = os.path.join(story_dir, "FULL_STORY.txt")
+            with open(full_story_path, 'w', encoding='utf-8') as f:
+                for ch in chapters_with_text:
+                    f.write(ch.get('Chapter_Text', ''))
+                    f.write('\n\n')
+            total_chars = sum(len(ch.get('Chapter_Text', '')) for ch in chapters_with_text)
+            print(f"  + FULL_STORY.txt  ({total_chars:,} chars, "
+                  f"{len(chapters_with_text)} chapters combined)")
+
+        # ── Comments outputs ──────────────────────────────────────────────────
+        if not self.should_scrape_comments:
+            return
+
+        all_comment_rows = []
+
+        comments_dir           = os.path.join(story_dir, "comments")
+        comments_full_data_dir = os.path.join(comments_dir, "comments_full_data")
+        comments_text_dir      = os.path.join(comments_dir, "comments_text")
+
+        os.makedirs(comments_full_data_dir, exist_ok=True)
+        os.makedirs(comments_text_dir,      exist_ok=True)
+
+        FULL_FIELDS = ["chapter_order", "chapter_title", "part_id",
+                       "user", "text", "likes", "replies", "created"]
+
+        # text-only file has just the 'text' column
+        TEXT_FIELDS = ["text"]
+
+        # Collect per-chapter text lists for the column-wise combined file
+        # { chapter_title: [text, text, ...] }
+        chapter_text_columns = {}
+
+        for ch in chapters:
+            raw_comments = ch.get('raw_comments', [])
+            if not raw_comments:
                 continue
-            ch_title   = row.get('Title', f"Chapter {idx+1}")
-            safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', ch_title).strip()[:100]
-            filename   = f"{idx+1:02d} - {safe_title}.txt"
-            filepath   = os.path.join(chapters_dir, filename)
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(f"{ch_title}\n")
-                f.write("=" * len(ch_title) + "\n\n")
-                f.write(text)
-            saved_individually += 1
 
-        print(f"  ✓ {saved_individually} individual chapter files → chapters/")
+            order   = ch.get('Order', 0)
+            title   = ch.get('Title', f"Chapter {order}")
+            url     = ch.get('URL', '')
+            part_id = _extract_part_id(url) or ""
 
-        # ── FULL_STORY.txt  (pure story text — no metadata) ──────────────────
-        chapters_with_text = [
-            row for _, row in df_chapters.iterrows()
-            if pd.notna(row.get('Chapter_Text', '')) and row.get('Chapter_Text', '')
-        ]
+            parsed_rows = [
+                _parse_comment(c, order, title, part_id)
+                for c in raw_comments
+            ]
+            all_comment_rows.extend(parsed_rows)
 
-        full_story_path = os.path.join(story_dir, "FULL_STORY.txt")
-        with open(full_story_path, 'w', encoding='utf-8') as f:
-            for row in chapters_with_text:
-                f.write(row.get('Chapter_Text', ''))
-                f.write('\n\n')
+            # Collect texts for the column-wise file (keyed by title)
+            chapter_text_columns[title] = [row["text"] for row in parsed_rows]
 
-        total_chars = sum(len(row.get('Chapter_Text', '')) for row in chapters_with_text)
-        print(f"  ✓ FULL_STORY.txt  ({total_chars:,} chars, "
-              f"{len(chapters_with_text)} chapters combined)")
+            safe_title = _make_safe_filename(title)
+            prefix     = f"{order:02d} - {safe_title}"
+
+            # Per-chapter full CSV -> comments/comments_full_data/
+            full_path = os.path.join(comments_full_data_dir, f"{prefix}-comments.csv")
+            with open(full_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=FULL_FIELDS)
+                writer.writeheader()
+                writer.writerows(parsed_rows)
+
+            # Per-chapter text-only CSV -> comments/comments_text/
+            text_path = os.path.join(comments_text_dir, f"{prefix}-comments_text.csv")
+            with open(text_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=TEXT_FIELDS)
+                writer.writeheader()
+                for row in parsed_rows:
+                    writer.writerow({"text": row["text"]})
+
+            print(f"  + {len(parsed_rows):>4} comments -> comments_full_data/{prefix}-comments.csv")
+            print(f"  + {len(parsed_rows):>4} comments -> comments_text/{prefix}-comments_text.csv")
+
+        # ── complete_comments_text.csv — one column per chapter ───────────────
+        # Each column header = chapter title, rows = comment texts for that chapter.
+        # Chapters with fewer comments get empty cells to pad to the longest column.
+        if chapter_text_columns:
+            max_rows = max(len(v) for v in chapter_text_columns.values())
+            col_path = os.path.join(comments_text_dir, "complete_comments_text.csv")
+            with open(col_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=list(chapter_text_columns.keys()))
+                writer.writeheader()
+                for i in range(max_rows):
+                    row = {
+                        ch_title: (texts[i] if i < len(texts) else "")
+                        for ch_title, texts in chapter_text_columns.items()
+                    }
+                    writer.writerow(row)
+            total_cols = len(chapter_text_columns)
+            print(f"  + complete_comments_text.csv  "
+                  f"({total_cols} chapter columns, {max_rows} max rows) "
+                  f"-> comments_text/")
+
+        # ── complete_comments_full_data.csv — all chapters, all fields ────────
+        if all_comment_rows:
+            complete_full_path = os.path.join(
+                comments_full_data_dir, "complete_comments_full_data.csv"
+            )
+            with open(complete_full_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=FULL_FIELDS)
+                writer.writeheader()
+                writer.writerows(all_comment_rows)
+            print(f"  + complete_comments_full_data.csv  "
+                  f"({len(all_comment_rows)} total comments) "
+                  f"-> comments_full_data/")
+
+        # Combined all_comments.csv (full data) at story root
+        if all_comment_rows:
+            all_csv_path = os.path.join(story_dir, "all_comments.csv")
+            with open(all_csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=FULL_FIELDS)
+                writer.writeheader()
+                writer.writerows(all_comment_rows)
+            print(f"  + all_comments.csv  ({len(all_comment_rows)} total comments)")
+        else:
+            print("  ! No comments were fetched across any chapter.")
 
     # ── single story runner ───────────────────────────────────────────────────
 
     def _run_single_story(self, url):
-        """Scrapes one story and saves outputs to outputs/<story title>/"""
         print(f"\n{'='*70}")
         print(f"SCRAPING: {url}")
         print(f"{'='*70}")
@@ -631,7 +916,6 @@ class WattpadScraperV5Parallel:
         if chapters:
             story_meta['Total_Parts'] = str(len(chapters))
 
-        # Build output folder from story title
         folder_name = _make_safe_folder_name(story_meta['Title'])
         story_dir   = os.path.join("outputs", folder_name)
 
@@ -647,20 +931,13 @@ class WattpadScraperV5Parallel:
     # ── public entry point ────────────────────────────────────────────────────
 
     def run(self, urls: list):
-        """
-        Scrapes one or more story URLs sequentially (story pages),
-        with parallel chapter scraping within each story.
-
-        Args:
-            urls: list of Wattpad story URLs
-        """
         urls = [u.strip() for u in urls if u.strip()]
         if not urls:
             print("[ERROR] No URLs provided.")
             return
 
         print(f"\n{'='*70}")
-        print(f"WATTPAD MULTI-STORY SCRAPER  —  {len(urls)} story/stories")
+        print(f"WATTPAD MULTI-STORY SCRAPER  --  {len(urls)} story/stories")
         print(f"{'='*70}")
 
         all_story_meta = []
@@ -672,15 +949,15 @@ class WattpadScraperV5Parallel:
                 story_meta, chapters, story_dir = self._run_single_story(url)
 
                 if self.should_scrape_stats and chapters:
-                    # Quit main driver before spawning workers to free memory
+                    cookies = self._get_session_cookies() if self.should_scrape_comments else {}
+
                     self._main_driver.quit()
                     self._main_driver = None
 
                     chapters = self._run_parallel_chapter_scrape(
-                        chapters, story_meta['Title']
+                        chapters, story_meta['Title'], cookies
                     )
 
-                    # Restart main driver for the next story (if any remaining)
                     if story_num < len(urls):
                         print("\n  Restarting main driver for next story...")
                         self._main_driver = self._make_driver(headless=False)
@@ -698,10 +975,12 @@ class WattpadScraperV5Parallel:
             if self._main_driver:
                 try:
                     self._main_driver.quit()
+                    print("  Main Chrome instance closed.")
                 except Exception:
                     pass
+                finally:
+                    self._main_driver = None
 
-        # ── Summary CSV across all stories ────────────────────────────────────
         if all_story_meta:
             os.makedirs("outputs", exist_ok=True)
             summary_path = os.path.join("outputs", "all_stories_summary.csv")
@@ -709,12 +988,12 @@ class WattpadScraperV5Parallel:
                 summary_path, index=False, encoding='utf-8-sig'
             )
             print(f"\n{'='*70}")
-            print(f"ALL DONE — {len(all_story_meta)} story/stories scraped")
+            print(f"ALL DONE -- {len(all_story_meta)} story/stories scraped")
             print(f"Summary saved to: {summary_path}")
             print(f"{'='*70}")
             for meta in all_story_meta:
                 folder = _make_safe_folder_name(meta['Title'])
-                print(f"  • outputs/{folder}/")
+                print(f"  * outputs/{folder}/")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -722,10 +1001,6 @@ class WattpadScraperV5Parallel:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_urls_from_file(filepath: str) -> list:
-    """
-    Reads URLs from a plain text file — one URL per line.
-    Ignores blank lines and lines starting with # (comments).
-    """
     filepath = filepath.strip().strip('"').strip("'")
     if not os.path.exists(filepath):
         print(f"  [ERROR] File not found: {filepath}")
@@ -743,7 +1018,7 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
 
     print("=" * 70)
-    print("WATTPAD SCRAPER V5.1 — Multi-URL + Parallel + Per-Story Folders")
+    print("WATTPAD SCRAPER V5.4 -- Multi-URL + Parallel + Per-Story Folders")
     print("=" * 70)
     print()
     print("Modes:")
@@ -754,7 +1029,14 @@ if __name__ == "__main__":
 
     choice = input("Enter choice (1/2/3): ").strip()
 
-    # ── URL input method ──────────────────────────────────────────────────────
+    scrape_comments = False
+    if choice in ('2', '3'):
+        print()
+        comments_choice = input(
+            "Scrape comments for each chapter? (Y/N, default N): "
+        ).strip().upper()
+        scrape_comments = comments_choice == 'Y'
+
     print()
     print("URL source:")
     print("  F. Load from a .txt file  (one URL per line, # for comments)")
@@ -762,20 +1044,18 @@ if __name__ == "__main__":
     print()
 
     url_source = input("Enter choice (F/M): ").strip().upper()
-
     urls = []
 
     if url_source == 'F':
         txt_path = input("\nEnter path to .txt file: ").strip().strip('"').strip("'")
         urls = _load_urls_from_file(txt_path)
         if urls:
-            print(f"\n  ✓ Loaded {len(urls)} URL(s) from '{txt_path}':")
+            print(f"\n  + Loaded {len(urls)} URL(s) from '{txt_path}':")
             for i, u in enumerate(urls, 1):
                 print(f"    {i}. {u}")
         else:
             print("  No valid URLs found in file.")
-
-    else:  # Manual entry
+    else:
         print()
         print("Enter Wattpad story URLs (one per line, blank line when done):")
         print()
@@ -786,11 +1066,9 @@ if __name__ == "__main__":
             urls.append(line)
 
     if not urls:
-        # Fallback demo URL
         urls = ["https://www.wattpad.com/story/353975883-homecoming"]
-        print(f"\nNo URLs provided — using demo: {urls[0]}")
+        print(f"\nNo URLs provided -- using demo: {urls[0]}")
 
-    # ── Worker count ──────────────────────────────────────────────────────────
     workers_input = input("\nNumber of parallel workers per story (Enter for 3): ").strip()
     num_workers   = int(workers_input) if workers_input.isdigit() else 3
 
@@ -800,6 +1078,7 @@ if __name__ == "__main__":
     print(f"\n{'='*70}")
     print(f"  Stories   : {len(urls)}")
     print(f"  Mode      : {'Stats + Text' if extract_text else 'Stats only' if scrape_stats else 'Metadata only'}")
+    print(f"  Comments  : {'Yes' if scrape_comments else 'No'}")
     print(f"  Workers   : {num_workers} parallel Chrome instances per story")
     print(f"{'='*70}\n")
 
@@ -807,6 +1086,7 @@ if __name__ == "__main__":
         headless=True,
         scrape_chapter_stats=scrape_stats,
         extract_chapter_text=extract_text,
+        scrape_comments=scrape_comments,
         num_workers=num_workers
     )
     scraper.run(urls)
